@@ -190,6 +190,7 @@ func (bs *builderSuite) TestFlatten(c *C) {
     run "echo foo >bar"
     run "echo here is another layer >a_file"
     tag "notflattened"
+    run "chown -R nobody:nogroup a_file"
     flatten
     tag "flattened"
   `)
@@ -205,6 +206,9 @@ func (bs *builderSuite) TestFlatten(c *C) {
 	inspect, _, err = dockerClient.ImageInspectWithRaw(context.Background(), "notflattened")
 	c.Assert(err, IsNil)
 	c.Assert(len(inspect.RootFS.Layers), Not(Equals), 1)
+
+	result := runContainerCommand(c, b, []string{"/bin/sh", "-c", "/usr/bin/stat -c %U a_file"})
+	c.Assert(string(result), Equals, "nobody\n")
 }
 
 func (bs *builderSuite) TestEntrypointCmd(c *C) {
