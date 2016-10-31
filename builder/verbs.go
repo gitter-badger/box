@@ -162,7 +162,7 @@ func flatten(b *Builder, cacheKey string, args []*mruby.MrbValue, m *mruby.Mrb, 
 
 	defer b.exec.Destroy(id)
 
-	rc, err := b.exec.CopyFromContainer(id, "/")
+	rc, size, err := b.exec.CopyFromContainer(id, "/")
 	if err != nil {
 		return nil, createException(m, err.Error())
 	}
@@ -189,7 +189,7 @@ func flatten(b *Builder, cacheKey string, args []*mruby.MrbValue, m *mruby.Mrb, 
 	b.exec.Config().Image = ""
 
 	hook := func(id string) (string, error) {
-		if err := b.exec.CopyToContainer(id, "/", f); err != nil {
+		if err := b.exec.CopyToContainer(id, size, f); err != nil {
 			return "", err
 		}
 
@@ -437,9 +437,14 @@ func copy(b *Builder, cacheKey string, args []*mruby.MrbValue, m *mruby.Mrb, sel
 		return nil, createException(m, err.Error())
 	}
 
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, createException(m, err.Error())
+	}
+
 	hook := func(id string) (string, error) {
 		defer f.Close()
-		return "", b.exec.CopyToContainer(id, "/", f)
+		return "", b.exec.CopyToContainer(id, fi.Size(), f)
 	}
 
 	if err := b.exec.Commit(cacheKey, hook); err != nil {

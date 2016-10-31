@@ -3,8 +3,10 @@ package docker
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -12,11 +14,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/docker/pkg/term"
-	"github.com/docker/engine-api/client"
-	"github.com/docker/engine-api/types"
 	"github.com/erikh/box/builder/config"
 	"github.com/erikh/box/builder/executor"
 	"github.com/erikh/box/log"
@@ -226,15 +229,236 @@ func (d *Docker) Destroy(id string) error {
 
 // CopyFromContainer copies a series of files in a similar fashion to
 // CopyToContainer, just in reverse.
-func (d *Docker) CopyFromContainer(id, path string) (io.Reader, error) {
-	rc, _, err := d.client.CopyFromContainer(context.Background(), id, path)
-	return rc, err
+func (d *Docker) CopyFromContainer(id, path string) (io.Reader, int64, error) {
+	rc, stat, err := d.client.CopyFromContainer(context.Background(), id, path)
+	return rc, stat.Size, err
 }
 
 // CopyToContainer copies a tarred up series of files (passed in through the
 // io.Reader handle) to the container where they are untarred.
-func (d *Docker) CopyToContainer(id, path string, tw io.Reader) error {
-	return d.client.CopyToContainer(context.Background(), id, path, tw, types.CopyToContainerOptions{AllowOverwriteDirWithFile: true})
+func (d *Docker) CopyToContainer(id string, size int64, tw io.Reader) error {
+	tf, err := ioutil.TempFile("", "box-temporary-layer")
+	if err != nil {
+		return err
+	}
+
+	defer tf.Close() // second close is fine here
+	defer os.Remove(tf.Name())
+
+	if _, err := io.Copy(tf, tw); err != nil {
+		return err
+	}
+
+	tf.Close()
+
+	errChan := make(chan error)
+
+	copyID := id
+	jsonFile := fmt.Sprintf("%s.json", copyID)
+	tarFile := fmt.Sprintf("%s/layer.tar", copyID)
+
+	repos := map[string]map[string]string{
+		copyID: {"latest": copyID},
+	}
+
+	manifest := []map[string]interface{}{{
+		"Config":   jsonFile,
+		"RepoTags": []string{copyID},
+		"Layers":   []string{tarFile},
+	}}
+
+	image := d.config.ToImage([]string{copyID})
+
+	r, w := io.Pipe()
+	r2 := io.TeeReader(r, w)
+	go func(r io.Reader) {
+		f, err := os.Create("test")
+
+		if err != nil {
+			panic(err)
+		}
+
+		fmt.Println(io.Copy(f, r))
+	}(r2)
+
+	go func(r io.ReadCloser) {
+		io.Copy(os.Stdout, r)
+		rc, err := d.client.ImageImport(context.Background(), types.ImageImportSource{Source: r}, "box-"+copyID, types.ImageImportOptions{})
+		if err == nil {
+			// FIXME workaround for a client issue. Fix this in docker.
+			content, err := ioutil.ReadAll(rc)
+			if err != nil {
+				errChan <- err
+				return
+			}
+
+			lines := bytes.Split(content, []byte("\r\n"))
+			for _, line := range lines {
+				result := map[string]interface{}{}
+				fmt.Println("line:", string(line))
+
+				if err := json.Unmarshal(line, &result); err != nil {
+					errChan <- err
+					return
+				}
+
+				if res, ok := result["error"].(string); ok {
+					errChan <- errors.New(res)
+					return
+				}
+			}
+		}
+
+		errChan <- err
+	}(r)
+
+	imgwriter := tar.NewWriter(w)
+
+	content, err := json.Marshal(image)
+	if err != nil {
+		return err
+	}
+
+	err = imgwriter.WriteHeader(&tar.Header{
+		Uname:      "root",
+		Gname:      "root",
+		Name:       jsonFile,
+		Linkname:   jsonFile,
+		Size:       int64(len(content)),
+		Mode:       0666,
+		Typeflag:   tar.TypeReg,
+		ModTime:    time.Now(),
+		AccessTime: time.Now(),
+		ChangeTime: time.Now(),
+	})
+
+	if err != nil {
+		fmt.Println("here")
+		return err
+	}
+
+	if _, err := imgwriter.Write(content); err != nil {
+		fmt.Println("here")
+		return err
+	}
+
+	content, err = json.Marshal(repos)
+	if err != nil {
+		return err
+	}
+
+	err = imgwriter.WriteHeader(&tar.Header{
+		Name:       "repositories",
+		Linkname:   "repositories",
+		Uname:      "root",
+		Gname:      "root",
+		Size:       int64(len(content)),
+		Mode:       0666,
+		Typeflag:   tar.TypeReg,
+		ModTime:    time.Now(),
+		AccessTime: time.Now(),
+		ChangeTime: time.Now(),
+	})
+
+	if err != nil {
+		fmt.Println("here")
+		return err
+	}
+
+	if _, err := imgwriter.Write(content); err != nil {
+		fmt.Println("here")
+		return err
+	}
+
+	content, err = json.Marshal(manifest)
+	if err != nil {
+		return err
+	}
+
+	err = imgwriter.WriteHeader(&tar.Header{
+		Name:       "manifest.json",
+		Linkname:   "manifest.json",
+		Uname:      "root",
+		Gname:      "root",
+		ModTime:    time.Now(),
+		AccessTime: time.Now(),
+		ChangeTime: time.Now(),
+		Size:       int64(len(content)),
+		Mode:       0666,
+		Typeflag:   tar.TypeReg,
+	})
+
+	if err != nil {
+		fmt.Println("here")
+		return err
+	}
+
+	if _, err := imgwriter.Write(content); err != nil {
+		fmt.Println("here")
+		return err
+	}
+
+	imgwriter.Close()
+	w.Close()
+
+	/*
+		fi, err := os.Stat(tf.Name())
+		if err != nil {
+			cancel()
+			errChan <- err
+			return
+		}
+
+		err = imgwriter.WriteHeader(&tar.Header{
+			Name:     copyID,
+			Mode:     0777,
+			Typeflag: tar.TypeDir,
+		})
+
+		if err != nil {
+			cancel()
+			errChan <- err
+			return
+		}
+
+			err = imgwriter.WriteHeader(&tar.Header{
+				Name:     tarFile,
+				Size:     fi.Size(),
+				Mode:     0666,
+				Typeflag: tar.TypeReg,
+			})
+
+			if err != nil {
+				cancel()
+				errChan <- err
+				return
+			}
+
+			tr, err := os.Open(tf.Name())
+			if err != nil {
+				cancel()
+				errChan <- err
+				return
+			}
+
+			defer tr.Close()
+
+			x, err := io.Copy(imgwriter, tr)
+			fmt.Println(x, err)
+			if err != nil {
+				cancel()
+				errChan <- err
+				return
+			}
+	*/
+
+	if err := <-errChan; err != nil {
+		return err
+	}
+
+	d.config.Image = copyID
+
+	return nil
 }
 
 // Tag an image with the provided string.
@@ -285,7 +509,7 @@ func (d *Docker) RunHook(id string) (string, error) {
 	}
 
 	stopChan := make(chan struct{})
-	errChan := make(chan error)
+	errChan := make(chan error, 1)
 
 	if d.stdin {
 		state, err := term.SetRawTerminal(0)
