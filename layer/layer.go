@@ -67,16 +67,23 @@ func (l *Layer) inChdir(fun func(l *Layer) error) error {
 	return os.Chdir(wd)
 }
 
-func (l *Layer) qualified() string {
+// Path is the fully-qualified path to the layer entry.
+func (l *Layer) Path() string {
 	return filepath.Join(l.workingDir, l.dirname)
 }
 
 // Create creates the layer
 func (l *Layer) Create() error {
-	return l.inChdir(func(l *Layer) error { return os.Mkdir(l.qualified(), dirMode) })
+	return os.Mkdir(l.Path(), dirMode)
 }
 
 // Remove removes the layer
 func (l *Layer) Remove() error {
-	return l.inChdir(func(l *Layer) error { return os.RemoveAll(l.qualified()) })
+	return os.RemoveAll(l.Path())
+}
+
+// Exists returns true if a layer exists, and false if not.
+func (l *Layer) Exists() bool {
+	fi, _ := os.Stat(l.Path())
+	return fi != nil
 }

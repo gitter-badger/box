@@ -112,3 +112,21 @@ func (s *layerSuite) TestCreateRemove(c *C) {
 		c.Assert(err, NotNil)
 	})
 }
+
+func (s *layerSuite) TestFilesystemMount(c *C) {
+	dir, err := ioutil.TempDir("", "box-mount-test")
+	c.Assert(err, IsNil)
+
+	target := filepath.Join(dir, "quux")
+	c.Assert(os.Mkdir(target, 0700), IsNil)
+
+	fs := &Filesystem{Mountpoint: target}
+	l, err := New("foo", dir)
+	c.Assert(err, IsNil)
+
+	l2, err := New("bar", dir)
+	c.Assert(err, IsNil)
+
+	fs.Layers = []*Layer{l, l2}
+	c.Assert(fs.Mount(filepath.Join(dir, "work")), IsNil)
+}
